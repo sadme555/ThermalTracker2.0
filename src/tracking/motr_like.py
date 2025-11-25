@@ -1,7 +1,11 @@
 from typing import List, Dict, Any
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+
+from models.track_update import TrackUpdateNet
+from models.simple_motr import SimpleMOTRLikeModel
 
 def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
     """
@@ -78,23 +82,107 @@ def extract_roi_feature(
     feat = patch.reshape(-1)  # [C*out_size*out_size]
     return feat
 
+def boxes_xyxy_to_cxcywh_norm(boxes: torch.Tensor, img_h: float, img_w: float) -> torch.Tensor:
+    """
+    boxes: [N,4] 像素坐标 [x1,y1,x2,y2]
+    返回: [N,4] 归一化 (cx,cy,w,h)
+    """
+    x1, y1, x2, y2 = boxes.unbind(dim=1)
+    cx = (x1 + x2) / 2.0 / img_w
+    cy = (y1 + y2) / 2.0 / img_h
+    w = (x2 - x1) / img_w
+    h = (y2 - y1) / img_h
+    return torch.stack([cx, cy, w, h], dim=1)
+
+
+def boxes_cxcywh_norm_to_xyxy(boxes: torch.Tensor, img_h: float, img_w: float) -> torch.Tensor:
+    """
+    boxes: [N,4] 归一化 (cx,cy,w,h)
+    返回: [N,4] 像素坐标 [x1,y1,x2,y2]
+    """
+    cx, cy, w, h = boxes.unbind(dim=1)
+    cx = cx * img_w
+    cy = cy * img_h
+    w = w * img_w
+    h = h * img_h
+    x1 = cx - w / 2.0
+    y1 = cy - h / 2.0
+    x2 = cx + w / 2.0
+    y2 = cy + h / 2.0
+    return torch.stack([x1, y1, x2, y2], dim=1)
+
+
+
 class MOTRLikeTracker:
     """
-    目前版本：完全用 **GT boxes** 当检测结果，只做 IOU 匹配 + 轨迹管理。
-
-    接口：
-      - reset(seq_name): 开始一个新视频
-      - step(img, meta): 输入一帧图像 + GT 框，输出这一帧的轨迹列表
-        meta 里需要：
-          - "frame_id": int
-          - "gt_boxes": Tensor[N,4] （像素坐标 [x1,y1,x2,y2]）
+    当前版本：
+      - 可以用 GT 当检测结果（use_detector=False）
+      - 也可以用 SimpleMOTRLikeModel 当检测器（use_detector=True）
+      - 如果 use_track_update=True，会用 TrackUpdateNet 做时序预测
     """
 
-    def __init__(self, iou_thresh: float = 0.5):
+    def __init__(
+        self,
+        iou_thresh: float = 0.5,
+        use_track_update: bool = True,
+        track_update_ckpt: str = "checkpoints/track_update.pth",
+        use_detector: bool = False,
+        detector_ckpt: str = "checkpoints/simple_motr.pth",
+        detector_num_queries: int = 16,
+        device: str = "cuda",
+    ):
+        # 基本参数
         self.iou_thresh = iou_thresh
         self.active_tracks: Dict[int, Dict[str, Any]] = {}
         self.next_track_id: int = 1
         self.current_seq_name: str = ""
+
+        # 设备
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+
+        # === TrackUpdateNet ===
+        self.use_track_update = use_track_update
+        self.track_update = None
+
+        if self.use_track_update:
+            feat_dim = 3 * 8 * 8  # 和我们训练时的 ROI 特征维度一致
+            self.track_update = TrackUpdateNet(feat_dim=feat_dim, hidden_dim=256)
+
+            ckpt_path = Path(track_update_ckpt)
+            if ckpt_path.exists():
+                print(f"[Tracker] Loading TrackUpdateNet from {ckpt_path}")
+                state = torch.load(ckpt_path, map_location="cpu")
+                if "model" in state:
+                    self.track_update.load_state_dict(state["model"])
+                else:
+                    self.track_update.load_state_dict(state)
+                self.track_update.eval()
+            else:
+                print(f"[Tracker] WARNING: TrackUpdateNet ckpt not found at {ckpt_path}, disable it.")
+                self.track_update = None
+                self.use_track_update = False
+
+        # === SimpleMOTRLikeModel 检测器 ===
+        self.use_detector = use_detector
+        self.detector = None
+
+        if self.use_detector:
+            self.detector = SimpleMOTRLikeModel(num_queries=detector_num_queries).to(self.device)
+            det_ckpt_path = Path(detector_ckpt)
+            if det_ckpt_path.exists():
+                print(f"[Tracker] Loading detector from {det_ckpt_path}")
+                state = torch.load(det_ckpt_path, map_location=self.device)
+                if "model" in state:
+                    self.detector.load_state_dict(state["model"])
+                else:
+                    self.detector.load_state_dict(state)
+                self.detector.eval()
+            else:
+                print(f"[Tracker] WARNING: detector ckpt not found at {det_ckpt_path}, disable detector.")
+                self.detector = None
+                self.use_detector = False
+
+
 
     def reset(self, seq_name: str):
         """开始一个新序列，清空已有轨迹。"""
@@ -104,19 +192,48 @@ class MOTRLikeTracker:
 
     def step(self, img: torch.Tensor, meta: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        :param img: 一帧图像 [C,H,W]（目前没用，将来可以给模型用）
-        :param meta: 包含
-            - "frame_id": int
-            - "gt_boxes": Tensor[N,4]，当前帧的 GT 检测框（像素坐标）
-        :return: 这一帧的轨迹列表，每个元素是一个 dict:
-            {
-              "track_id": int,
-              "box": Tensor[4],   # [x1,y1,x2,y2]
-              "frame_id": int,
-            }
+        img: [3,H,W]，当前帧图像（现在只用红外）
+        meta:
+          - "frame_id": int
+          - "gt_boxes": Tensor[M,4]，当前帧 GT（只用于可视化 / debug）
         """
         frame_id: int = meta["frame_id"]
-        det_boxes: torch.Tensor = meta["gt_boxes"]  # [N,4]
+        gt_boxes: torch.Tensor = meta.get("gt_boxes", None)
+
+        C, H, W = img.shape
+
+        # ===== 1. 得到当前帧的检测框 det_boxes =====
+        if self.use_detector and self.detector is not None:
+            # 用 SimpleMOTRLikeModel 做检测
+            img_in = img.unsqueeze(0).to(self.device)  # [1,3,H,W]
+            with torch.no_grad():
+                pred_boxes_norm = self.detector(img_in)  # 约定输出 [1,Q,4]，归一化 cxcywh
+
+            # 如果模型返回的是 tuple/list，把第一个当 boxes
+            if isinstance(pred_boxes_norm, (list, tuple)):
+                pred_boxes_norm = pred_boxes_norm[0]
+
+            pred_boxes_norm = pred_boxes_norm[0].to("cpu")   # [Q,4]
+
+            # 归一化 cxcywh -> 像素 xyxy
+            det_boxes = boxes_cxcywh_norm_to_xyxy(pred_boxes_norm, H, W)  # [Q,4]
+
+            # 简单过滤一下无效框（宽/高 <= 0）
+            x1, y1, x2, y2 = det_boxes.unbind(dim=1)
+            keep = (x2 > x1) & (y2 > y1)
+            det_boxes = det_boxes[keep]
+
+        else:
+            # 不用检测器，就退回到“GT 当检测”的老逻辑
+            if gt_boxes is None:
+                det_boxes = torch.zeros((0, 4))
+            else:
+                det_boxes = gt_boxes
+
+        # 当前没有任何检测，直接返回空
+        if det_boxes.numel() == 0:
+            return []
+
 
         # 当前没有任何检测，直接返回
         if det_boxes.numel() == 0:
@@ -125,14 +242,37 @@ class MOTRLikeTracker:
         # 把当前 active_tracks 的 box 收集起来
         if len(self.active_tracks) > 0:
             track_ids = list(self.active_tracks.keys())
+            # 上一帧 box
             track_boxes = torch.stack(
-                [self.active_tracks[tid]["box"] for tid in track_ids],
+                [self.active_tracks[track_id]["box"] for track_id in track_ids],
                 dim=0,
             )  # [T,4]
-            ious = box_iou(track_boxes, det_boxes)  # [T,N]
+
+            if self.use_track_update and self.track_update is not None:
+                track_feats = torch.stack(
+                    [self.active_tracks[track_id]["feat"] for track_id in track_ids],
+                    dim=0,
+                )  # [T,D]
+
+                box_t_cxcywh = boxes_xyxy_to_cxcywh_norm(track_boxes, H, W)  # [T,4]
+
+                with torch.no_grad():
+                    delta = self.track_update(track_feats, box_t_cxcywh)  # [T,4]
+                    box_pred_cxcywh = box_t_cxcywh + delta                 # [T,4]
+
+                # 当前帧的“预测框”（还没被 GT 校正）
+                track_pred_boxes = boxes_cxcywh_norm_to_xyxy(box_pred_cxcywh, H, W)  # [T,4]
+            else:
+                # 不用 TrackUpdateNet，就用上一帧 box 当“预测框”
+                track_pred_boxes = track_boxes  # [T,4]
+
+            # 用预测框和当前帧 GT 计算 IoU
+            ious = box_iou(track_pred_boxes, det_boxes)  # [T,N]
         else:
             track_ids = []
+            track_pred_boxes = torch.zeros((0, 4))
             ious = torch.zeros((0, det_boxes.size(0)))
+
 
         frame_tracks: List[Dict[str, Any]] = []
         num_det = det_boxes.size(0)
@@ -146,18 +286,20 @@ class MOTRLikeTracker:
             if max_iou >= self.iou_thresh and not det_assigned[det_idx]:
                 box = det_boxes[det_idx]
 
-                # === 新增：根据当前帧图像 + 新 box 提取轨迹特征 ===
                 feat = extract_roi_feature(img, box)  # [D]
+                pred_box = track_pred_boxes[t_idx]     # [4]，TrackUpdateNet 预测的当前帧位置
 
                 self.active_tracks[track_id]["box"] = box
                 self.active_tracks[track_id]["feat"] = feat
+                self.active_tracks[track_id]["pred_box"] = pred_box
                 self.active_tracks[track_id]["last_frame"] = frame_id
                 det_assigned[det_idx] = True
 
                 frame_tracks.append(
                     {
                         "track_id": track_id,
-                        "box": box,
+                        "box": box,          # 最终用 GT 更新后的 box
+                        "pred_box": pred_box,
                         "frame_id": frame_id,
                         "feat": feat,
                     }

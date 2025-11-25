@@ -50,7 +50,17 @@ def run_tracking_on_one_sequence(dataset, seq_to_frames, max_frames: int = 50):
 
     print(f"Run tracking on sequence: {seq_name}, total frames: {len(frames)}")
 
-    tracker = MOTRLikeTracker(iou_thresh=0.5)
+    tracker = MOTRLikeTracker(
+        iou_thresh=0.5,
+        use_track_update=True,
+        track_update_ckpt="checkpoints/track_update.pth",
+        use_detector=True,
+        detector_ckpt="checkpoints/simple_motr.pth",
+        detector_num_queries=16,
+        device="cuda",
+    )
+
+
     tracker.reset(seq_name)
 
     num_frames_to_run = min(max_frames, len(frames))
@@ -69,8 +79,6 @@ def run_tracking_on_one_sequence(dataset, seq_to_frames, max_frames: int = 50):
                 "gt_boxes": gt_boxes,
             },
         )
-
-
 
         print(f"[Seq {seq_name}] Frame {frame_id:04d}: "
               f"{len(tracks)} tracks (first few IDs: {[t['track_id'] for t in tracks[:3]]})")
