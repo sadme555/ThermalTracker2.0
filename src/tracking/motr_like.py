@@ -7,6 +7,44 @@ import torch.nn.functional as F
 from models.track_update import TrackUpdateNet
 from models.simple_motr import SimpleMOTRLikeModel
 
+def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: float):
+    if boxes.numel() == 0:
+        return torch.zeros((0,), dtype=torch.long)
+
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+
+    areas = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
+    _, order = scores.sort(descending=True)
+
+    keep = []
+    while order.numel() > 0:
+        i = order[0].item()
+        keep.append(i)
+
+        if order.numel() == 1:
+            break
+
+        # 注意这里用 torch.max / torch.min，兼容旧版本 PyTorch
+        xx1 = torch.max(x1[i], x1[order[1:]])
+        yy1 = torch.max(y1[i], y1[order[1:]])
+        xx2 = torch.min(x2[i], x2[order[1:]])
+        yy2 = torch.min(y2[i], y2[order[1:]])
+
+        w = (xx2 - xx1).clamp(min=0)
+        h = (yy2 - yy1).clamp(min=0)
+        inter = w * h
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+
+        mask = iou <= iou_thresh
+        order = order[1:][mask]
+
+    return torch.tensor(keep, dtype=torch.long)
+
+
+
 def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
     """
     计算 [N,4] 和 [M,4] 两组 bbox 的 IoU，格式都是 [x1,y1,x2,y2]，返回 [N,M].
@@ -202,26 +240,49 @@ class MOTRLikeTracker:
 
         C, H, W = img.shape
 
-        # ===== 1. 得到当前帧的检测框 det_boxes =====
         if self.use_detector and self.detector is not None:
             # 用 SimpleMOTRLikeModel 做检测
             img_in = img.unsqueeze(0).to(self.device)  # [1,3,H,W]
             with torch.no_grad():
-                pred_boxes_norm = self.detector(img_in)  # 约定输出 [1,Q,4]，归一化 cxcywh
+                pred_boxes_norm, pred_logits = self.detector(img_in)  # [1,Q,4], [1,Q]
 
-            # 如果模型返回的是 tuple/list，把第一个当 boxes
-            if isinstance(pred_boxes_norm, (list, tuple)):
-                pred_boxes_norm = pred_boxes_norm[0]
+            pred_boxes_norm = pred_boxes_norm[0].to("cpu")  # [Q,4]
+            pred_logits = pred_logits[0].to("cpu")          # [Q]
 
-            pred_boxes_norm = pred_boxes_norm[0].to("cpu")   # [Q,4]
+            # 分类 score
+            scores = pred_logits.sigmoid()                  # [Q]
 
-            # 归一化 cxcywh -> 像素 xyxy
-            det_boxes = boxes_cxcywh_norm_to_xyxy(pred_boxes_norm, H, W)  # [Q,4]
+            # ---------- 关键：先取 top-K，保证一定有框 ----------
+            Q = scores.numel()
+            if Q == 0:
+                det_boxes = torch.zeros((0, 4))
+            else:
+                top_k = min(20, Q)  # 每帧最多先保留 20 个 query
+                topk_scores, topk_idx = scores.topk(top_k)
+                pred_boxes_norm = pred_boxes_norm[topk_idx]   # [K,4]
+                scores = topk_scores                          # [K]
 
-            # 简单过滤一下无效框（宽/高 <= 0）
-            x1, y1, x2, y2 = det_boxes.unbind(dim=1)
-            keep = (x2 > x1) & (y2 > y1)
-            det_boxes = det_boxes[keep]
+                # 归一化 cxcywh -> 像素 xyxy
+                det_boxes_xyxy = boxes_cxcywh_norm_to_xyxy(pred_boxes_norm, H, W)  # [K,4]
+
+                # 过滤非法框
+                x1, y1, x2, y2 = det_boxes_xyxy.unbind(dim=1)
+                keep = (x2 > x1) & (y2 > y1)
+                det_boxes_xyxy = det_boxes_xyxy[keep]
+                scores = scores[keep]
+
+                if det_boxes_xyxy.numel() == 0:
+                    # 如果全是非法框，就直接认为没有检测
+                    det_boxes = torch.zeros((0, 4))
+                else:
+                    # NMS（但如果 NMS 把全抹掉了，就退回到全部）
+                    iou_thresh = 0.5
+                    keep_idx = nms(det_boxes_xyxy, scores, iou_thresh)
+                    if keep_idx.numel() == 0:
+                        # 防止一个都不剩，退回到原始的所有框
+                        det_boxes = det_boxes_xyxy
+                    else:
+                        det_boxes = det_boxes_xyxy[keep_idx]
 
         else:
             # 不用检测器，就退回到“GT 当检测”的老逻辑

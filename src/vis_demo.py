@@ -55,7 +55,7 @@ def main():
         track_update_ckpt="checkpoints/track_update.pth",
         use_detector=True,
         detector_ckpt="checkpoints/simple_motr.pth",
-        detector_num_queries=16,
+        detector_num_queries=32,
         device="cuda",
     )
 
