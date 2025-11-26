@@ -105,15 +105,18 @@ class SimpleMOTRLikeModel(nn.Module):
         # 简单 CNN backbone
         self.backbone = SimpleBackbone(out_dim=hidden_dim)
 
+        # 2D 位置编码，用来给特征图加上 (y,x)
+        self.pos_encoding = SimplePositionalEncoding2D(hidden_dim)
+
         # 可学习的 query embedding: [Q, C]
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
 
         # 一个 MultiHeadAttention，让 query 和特征图交互
-        # 注意：MultiheadAttention 默认输入形状是 [L, N, E] (L=序列长度, N=batch, E=通道数)
         self.self_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads)
 
         # 把注意力后的 query 特征 -> box + logit
         self.head = SimpleQueryHead(hidden_dim=hidden_dim, num_queries=num_queries)
+
 
     def forward(self, images: torch.Tensor):
         """
@@ -122,18 +125,19 @@ class SimpleMOTRLikeModel(nn.Module):
           - boxes:  [B, num_queries, 4] (cx,cy,w,h, 0~1)
           - logits: [B, num_queries]    (是否有目标的 logit)
         """
-        # 1) 提取特征: [B,C,H',W']
-        feats = self.backbone(images)
+        # 1) 提取特征并加上 2D 位置编码
+        feats = self.backbone(images)           # [B,C,H,W]
+        pos = self.pos_encoding(feats)          # [B,C,H,W]
+        feats = feats + pos                     # [B,C,H,W]
         B, C, H, W = feats.shape
 
-        # 2) 展平特征图: [B,C,H',W'] -> [HW,B,C]
+        # 2) 展平特征图: [B,C,H,W] -> [HW,B,C]
         feat_seq = feats.flatten(2).permute(2, 0, 1)  # [HW, B, C]
 
         # 3) 准备 query embedding: [Q,C] -> [Q,B,C]
         query_embed = self.query_embed.weight.unsqueeze(1).expand(-1, B, -1)  # [Q,B,C]
 
         # 4) MultiHeadAttention: query 看到整张特征图
-        #    query = [Q,B,C], key=value=[HW,B,C]
         attn_out, _ = self.self_attn(query_embed, feat_seq, feat_seq)  # [Q,B,C]
 
         # 5) 转成 [B,Q,C] 喂给 head
@@ -141,3 +145,42 @@ class SimpleMOTRLikeModel(nn.Module):
 
         boxes, logits = self.head(query_feats)   # [B,Q,4], [B,Q]
         return boxes, logits
+
+
+
+class SimplePositionalEncoding2D(nn.Module):
+    """
+    非常简易的 2D 位置编码：
+    - 在特征图尺寸 HxW 上生成归一化的 (y, x) 坐标；
+    - 通过 1x1 conv 投影到 hidden_dim 通道；
+    - 加到 backbone feature 上。
+    """
+
+    def __init__(self, num_channels: int):
+        super().__init__()
+        # 从 2 通道 (y,x) -> num_channels 的 1x1 卷积
+        self.proj = nn.Conv2d(2, num_channels, kernel_size=1)
+
+    def forward(self, feats: torch.Tensor) -> torch.Tensor:
+        """
+        feats: [B, C, H, W]
+        返回: [B, C, H, W] 的位置编码张量
+        """
+        B, C, H, W = feats.shape
+        device = feats.device
+
+        # y: [H], x: [W]，归一化到 [0,1]
+        ys = torch.linspace(0, 1, H, device=device)
+        xs = torch.linspace(0, 1, W, device=device)
+
+        # 生成网格： [H,W]
+        yy, xx = torch.meshgrid(ys, xs)  # 默认 indexing='ij' 在低版本 torch 是 OK 的
+
+        # 变成 [1,2,H,W] 然后扩展到 [B,2,H,W]
+        # 通道 0: y, 通道 1: x
+        coords = torch.stack([yy, xx], dim=0).unsqueeze(0)  # [1,2,H,W]
+        coords = coords.expand(B, -1, -1, -1)               # [B,2,H,W]
+
+        # 投影到 num_channels
+        pos = self.proj(coords)                             # [B,C,H,W]
+        return pos
